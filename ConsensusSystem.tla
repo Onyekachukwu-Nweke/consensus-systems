@@ -234,7 +234,7 @@ Progress ==
     (phase < 100) \/ (\E n \in Nodes : decided[n])
 
 \* State constraint to limit exploration
-StateConstraint == phase < 10
+StateConstraint == phase < 20
 
 -----------------------------------------------------------------------------
 \* Specification
