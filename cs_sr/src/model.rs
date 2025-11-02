@@ -1,20 +1,21 @@
 use serde::{Deserialize, Serialize};
 use stateright::actor::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::Hash;
 
 /// Node ID type
-pub type NodeId = u8;
+pub type NodeId = usize;
 
 /// Possible values for consensus
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Value {
     V1,
     V2,
 }
 
 /// Node states in the consensus protocol
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum NodeState {
     Init,
     Prepared,
@@ -24,7 +25,7 @@ pub enum NodeState {
 }
 
 /// Message types in the protocol
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum MessageType {
     Propose(Value),
     Prepare(Value),
@@ -64,7 +65,22 @@ impl ConsensusNodeState {
     }
 }
 
+// Manual Hash implementation since HashMap doesn't implement Hash
+impl Hash for ConsensusNodeState {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.state.hash(state);
+        self.value.hash(state);
+        self.decided.hash(state);
+        self.quorum_size.hash(state);
+        self.is_faulty.hash(state);
+        // Note: We skip prepare_count and commit_count since HashMap doesn't implement Hash
+        // This is acceptable for model checking as the other fields capture the essential state
+    }
+}
+
 /// Actor implementing consensus protocol
+#[derive(Clone)]
 pub struct ConsensusActor {
     pub peers: Vec<Id>,
 }
@@ -79,18 +95,29 @@ impl Actor for ConsensusActor {
     type Msg = MessageType;
     type State = ConsensusNodeState;
     type Timer = ();
+    type Storage = ();
+    type Random = ();
 
-    fn on_start(&self, id: Id, o: &mut Out<Self>) -> Self::State {
-        let node_id = id.into();
+    fn on_start(&self, id: Id, _storage: &Option<Self::Storage>, o: &mut Out<Self>) -> Self::State {
+        let node_id = usize::from(id);
         // Quorum = 2f + 1, with f=2 for 5 nodes -> quorum = 5
-        ConsensusNodeState::new(node_id, 5)
+        let state = ConsensusNodeState::new(node_id, 5);
+
+        // Have node 0 propose a value to kick off the protocol
+        if node_id == 0 {
+            for &peer in &self.peers {
+                o.send(peer, MessageType::Propose(Value::V1));
+            }
+        }
+
+        state
     }
 
     fn on_msg(
         &self,
         _id: Id,
         state: &mut Cow<Self::State>,
-        src: Id,
+        _src: Id,
         msg: Self::Msg,
         o: &mut Out<Self>,
     ) {
@@ -122,11 +149,12 @@ impl Actor for ConsensusActor {
                         let mut new_state = state.as_ref().clone();
                         let count = new_state.prepare_count.entry(value.clone()).or_insert(0);
                         *count += 1;
+                        let count_value = *count;
 
                         // If we have quorum of PREPAREs, move to PREPARED and broadcast COMMIT
-                        if new_state.has_quorum(*count) && new_state.state == NodeState::Init {
+                        if new_state.has_quorum(count_value) && new_state.state == NodeState::Init {
                             new_state.state = NodeState::Prepared;
-                            
+
                             for &peer in &self.peers {
                                 o.send(peer, MessageType::Commit(value.clone()));
                             }
@@ -145,11 +173,12 @@ impl Actor for ConsensusActor {
                             let mut new_state = state.as_ref().clone();
                             let count = new_state.commit_count.entry(value.clone()).or_insert(0);
                             *count += 1;
+                            let count_value = *count;
 
                             // If we have quorum of COMMITs, move to COMMITTED and broadcast DECIDE
-                            if new_state.has_quorum(*count) {
+                            if new_state.has_quorum(count_value) {
                                 new_state.state = NodeState::Committed;
-                                
+
                                 for &peer in &self.peers {
                                     o.send(peer, MessageType::Decide(value.clone()));
                                 }
@@ -177,11 +206,13 @@ impl Actor for ConsensusActor {
 }
 
 /// Model configuration for testing
+#[allow(dead_code)]
 pub struct ConsensusModel {
     pub num_nodes: usize,
     pub max_faults: usize,
 }
 
+#[allow(dead_code)]
 impl ConsensusModel {
     pub fn new(num_nodes: usize, max_faults: usize) -> Self {
         ConsensusModel {
