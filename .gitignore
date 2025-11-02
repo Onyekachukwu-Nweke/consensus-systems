@@ -1,3 +1,5 @@
 .vscode
 states/
 ConsensusSystem.out
+**/target
+**/Cargo.lock

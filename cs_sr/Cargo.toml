@@ -1,0 +1,13 @@
+[package]
+name = "cs_sr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.51", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+stateright = "0.31.0"
+
+[[bin]]
+name = "consensus"
+path = "src/main.rs"
