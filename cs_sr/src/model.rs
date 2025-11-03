@@ -12,6 +12,7 @@ pub type NodeId = usize;
 pub enum Value {
     V1,
     V2,
+    V3,  // Additional value for more realistic testing
 }
 
 /// Node states in the consensus protocol
@@ -33,6 +34,12 @@ pub enum MessageType {
     Decide(Value),
 }
 
+/// Timer types for non-deterministic actions
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum ConsensusTimer {
+    ProposeValue(Value),
+}
+
 /// Node internal state
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConsensusNodeState {
@@ -44,6 +51,7 @@ pub struct ConsensusNodeState {
     pub decided: bool,
     pub quorum_size: usize,
     pub is_faulty: bool,
+    pub has_proposed: bool,  // Track if this node has proposed a value
 }
 
 impl ConsensusNodeState {
@@ -57,6 +65,7 @@ impl ConsensusNodeState {
             decided: false,
             quorum_size,
             is_faulty: false,
+            has_proposed: false,
         }
     }
 
@@ -74,6 +83,7 @@ impl Hash for ConsensusNodeState {
         self.decided.hash(state);
         self.quorum_size.hash(state);
         self.is_faulty.hash(state);
+        self.has_proposed.hash(state);
         // Note: We skip prepare_count and commit_count since HashMap doesn't implement Hash
         // This is acceptable for model checking as the other fields capture the essential state
     }
@@ -83,30 +93,59 @@ impl Hash for ConsensusNodeState {
 #[derive(Clone)]
 pub struct ConsensusActor {
     pub peers: Vec<Id>,
+    pub faulty_nodes: Vec<usize>,  // List of node IDs that should be faulty
+    pub quorum_size: usize,        // Quorum size for consensus
 }
 
 impl ConsensusActor {
-    pub fn new(peers: Vec<Id>) -> Self {
-        ConsensusActor { peers }
+    /// Create a new consensus actor with no faulty nodes (used by tests)
+    #[allow(dead_code)]
+    pub fn new(peers: Vec<Id>, quorum_size: usize) -> Self {
+        ConsensusActor {
+            peers,
+            faulty_nodes: Vec::new(),
+            quorum_size,
+        }
+    }
+
+    /// Create a consensus actor with specified faulty nodes
+    pub fn with_faults(peers: Vec<Id>, faulty_nodes: Vec<usize>, quorum_size: usize) -> Self {
+        ConsensusActor {
+            peers,
+            faulty_nodes,
+            quorum_size,
+        }
     }
 }
 
 impl Actor for ConsensusActor {
     type Msg = MessageType;
     type State = ConsensusNodeState;
-    type Timer = ();
+    type Timer = ConsensusTimer;
     type Storage = ();
     type Random = ();
 
     fn on_start(&self, id: Id, _storage: &Option<Self::Storage>, o: &mut Out<Self>) -> Self::State {
         let node_id = usize::from(id);
-        // Quorum = 2f + 1, with f=2 for 5 nodes -> quorum = 5
-        let state = ConsensusNodeState::new(node_id, 5);
+        // Use the configured quorum size
+        let mut state = ConsensusNodeState::new(node_id, self.quorum_size);
 
-        // Have node 0 propose a value to kick off the protocol
-        if node_id == 0 {
+        // Check if this node should be faulty (per TLA+ NodeCrash action)
+        if self.faulty_nodes.contains(&node_id) {
+            state.is_faulty = true;
+            state.state = NodeState::Failed;
+            return state;  // Faulty nodes don't participate
+        }
+
+        // For non-deterministic model checking:
+        // Node 0 proposes all three possible values
+        // The model checker explores different orderings of message delivery
+        // creating branches where nodes might accept different values first
+        if node_id == 0 && !self.faulty_nodes.contains(&0) {
             for &peer in &self.peers {
                 o.send(peer, MessageType::Propose(Value::V1));
+                o.send(peer, MessageType::Propose(Value::V2));
+                o.send(peer, MessageType::Propose(Value::V3));
             }
         }
 
@@ -128,22 +167,26 @@ impl Actor for ConsensusActor {
 
         match msg {
             MessageType::Propose(value) => {
-                // Receive proposal
+                // ReceivePropose in TLA+: Node receives PROPOSE and broadcasts PREPARE
                 if state.state == NodeState::Init && state.value.is_none() {
                     let mut new_state = state.as_ref().clone();
                     new_state.value = Some(value.clone());
-                    
-                    // Broadcast PREPARE
+
+                    // Broadcast PREPARE to ALL nodes (including self per TLA+ spec)
                     for &peer in &self.peers {
                         o.send(peer, MessageType::Prepare(value.clone()));
                     }
-                    
+
+                    // Initialize our own prepare count to 1 (counting our own PREPARE)
+                    *new_state.prepare_count.entry(value.clone()).or_insert(0) = 1;
+
                     *state = Cow::Owned(new_state);
                 }
             }
 
             MessageType::Prepare(value) => {
-                // Count PREPARE messages
+                // ReceivePrepare in TLA+: Count PREPARE messages for our accepted value
+                // Only process if we have accepted this value
                 if let Some(ref my_value) = state.value {
                     if *my_value == value {
                         let mut new_state = state.as_ref().clone();
@@ -151,13 +194,18 @@ impl Actor for ConsensusActor {
                         *count += 1;
                         let count_value = *count;
 
-                        // If we have quorum of PREPAREs, move to PREPARED and broadcast COMMIT
+                        // If we reach quorum of PREPAREs and still in INIT, transition to PREPARED
+                        // Per TLA+: HasQuorum(prepareCount[n][m.value] + 1) - the +1 is already done above
                         if new_state.has_quorum(count_value) && new_state.state == NodeState::Init {
                             new_state.state = NodeState::Prepared;
 
+                            // Broadcast COMMIT to ALL nodes (including self)
                             for &peer in &self.peers {
                                 o.send(peer, MessageType::Commit(value.clone()));
                             }
+
+                            // Initialize our own commit count to 1 (counting our own COMMIT)
+                            *new_state.commit_count.entry(value.clone()).or_insert(0) = 1;
                         }
 
                         *state = Cow::Owned(new_state);
@@ -166,7 +214,8 @@ impl Actor for ConsensusActor {
             }
 
             MessageType::Commit(value) => {
-                // Count COMMIT messages
+                // ReceiveCommit in TLA+: Count COMMIT messages and transition when quorum reached
+                // Only process commits when in PREPARED state
                 if state.state == NodeState::Prepared {
                     if let Some(ref my_value) = state.value {
                         if *my_value == value {
@@ -175,10 +224,12 @@ impl Actor for ConsensusActor {
                             *count += 1;
                             let count_value = *count;
 
-                            // If we have quorum of COMMITs, move to COMMITTED and broadcast DECIDE
+                            // If we reach quorum of COMMITs, transition to COMMITTED
+                            // Per TLA+: HasQuorum(commitCount[n][m.value] + 1)
                             if new_state.has_quorum(count_value) {
                                 new_state.state = NodeState::Committed;
 
+                                // Broadcast DECIDE to ALL nodes (including self)
                                 for &peer in &self.peers {
                                     o.send(peer, MessageType::Decide(value.clone()));
                                 }
@@ -191,7 +242,8 @@ impl Actor for ConsensusActor {
             }
 
             MessageType::Decide(value) => {
-                // Finalize decision
+                // ReceiveDecide in TLA+: Finalize decision for this value
+                // A non-faulty node receives DECIDE and transitions to DECIDED state
                 if let Some(ref my_value) = state.value {
                     if *my_value == value && !state.decided {
                         let mut new_state = state.as_ref().clone();
@@ -199,6 +251,38 @@ impl Actor for ConsensusActor {
                         new_state.state = NodeState::Decided;
                         *state = Cow::Owned(new_state);
                     }
+                }
+            }
+        }
+    }
+
+    fn on_timeout(
+        &self,
+        _id: Id,
+        state: &mut Cow<Self::State>,
+        timer: &Self::Timer,
+        o: &mut Out<Self>,
+    ) {
+        // Don't process timers if node is faulty
+        if state.is_faulty {
+            return;
+        }
+
+        match timer {
+            ConsensusTimer::ProposeValue(value) => {
+                // Only propose if:
+                // 1. We're still in Init state (haven't accepted a proposal yet)
+                // 2. We haven't already proposed
+                if state.state == NodeState::Init && !state.has_proposed {
+                    let mut new_state = state.as_ref().clone();
+                    new_state.has_proposed = true;
+
+                    // Broadcast PROPOSE to ALL nodes (including self per TLA+ spec)
+                    for &peer in &self.peers {
+                        o.send(peer, MessageType::Propose(value.clone()));
+                    }
+
+                    *state = Cow::Owned(new_state);
                 }
             }
         }
